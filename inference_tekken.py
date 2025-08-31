@@ -5,12 +5,48 @@ from pathlib import Path
 from tqdm import tqdm
 from moviepy.editor import ImageSequenceClip
 import einops
+import types
 
 # Import necessary components from your project structure
 from owl_wms.configs import Config
 from owl_wms.models import get_model_cls
 from owl_wms.sampling import get_sampler_cls
 from owl_wms.utils.owl_vae_bridge import get_decoder_only, make_batched_decode_fn
+from owl_wms.nn.rope import OrthoRoPE
+
+# ======================================================================
+# V V V START: UPDATED CORRECTED FORWARD FUNCTION V V V
+# ======================================================================
+def corrected_rope_forward(self, x: torch.Tensor, offset: int = 0):
+    """
+    A corrected forward pass specifically for OrthoRoPE that handles mixed
+    precision and the "split-tensor" logic.
+    """
+    seq_len = x.shape[1]
+    
+    # Ensure cos and sin caches match the input tensor's dtype and device
+    cos = self.cos.to(dtype=x.dtype, device=x.device)
+    sin = self.sin.to(dtype=x.dtype, device=x.device)
+    
+    # Get the correct slice of the embeddings for the current sequence length
+    cos_emb = cos[offset : offset + seq_len].unsqueeze(1)
+    sin_emb = sin[offset : offset + seq_len].unsqueeze(1)
+    
+    # Split the input tensor into two halves along the last dimension
+    x1, x2 = x.chunk(2, dim=-1)
+
+    # Apply the rotary embeddings using the complex number rotation formula.
+    # This correctly handles the half-sized embedding dimensions.
+    out1 = x1 * cos_emb - x2 * sin_emb
+    out2 = x2 * cos_emb + x1 * sin_emb
+
+    # Concatenate the two halves back together
+    x_rope = torch.cat([out1, out2], dim=-1)
+    return x_rope
+# ======================================================================
+# ^ ^ ^ END: UPDATED CORRECTED FORWARD FUNCTION ^ ^ ^
+# ======================================================================
+
 
 def load_clean_state_dict(model, checkpoint_path, world_size=1):
     """
@@ -19,13 +55,11 @@ def load_clean_state_dict(model, checkpoint_path, world_size=1):
     """
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
 
-    # Handle checkpoints saved with EMA
     if 'ema' in checkpoint:
         checkpoint = checkpoint['ema']
     elif 'model' in checkpoint:
         checkpoint = checkpoint['model']
 
-    # Determine the prefix based on DDP and EMA wrapping
     is_ddp = any(k.startswith('module.') for k in checkpoint.keys())
     is_ema = any(k.startswith('ema_model.') for k in checkpoint.keys())
     
@@ -35,15 +69,12 @@ def load_clean_state_dict(model, checkpoint_path, world_size=1):
     if is_ddp:
         prefix += "module."
 
-    # If the model is a wrapper (has a .core attribute), add that to the prefix
     if hasattr(model, 'core'):
          prefix += "core."
 
-    # Strip prefixes if they exist
     if prefix:
         cleaned_state_dict = {k[len(prefix):]: v for k, v in checkpoint.items() if k.startswith(prefix)}
     else:
-        # Check for 'core.' prefix just in case it wasn't caught
         if any(k.startswith('core.') for k in checkpoint.keys()):
             prefix = "core."
             cleaned_state_dict = {k[len(prefix):]: v for k, v in checkpoint.items() if k.startswith(prefix)}
@@ -52,7 +83,6 @@ def load_clean_state_dict(model, checkpoint_path, world_size=1):
 
     target_model = model.core if hasattr(model, 'core') else model
     
-    # Load the cleaned state dict
     missing_keys, unexpected_keys = target_model.load_state_dict(cleaned_state_dict, strict=False)
     
     if missing_keys:
@@ -82,10 +112,26 @@ def main(args):
     print("Initializing model...")
     model = get_model_cls(model_cfg.model_id)(model_cfg)
     load_clean_state_dict(model, args.checkpoint)
+
+    # 3. APPLY MONKEY PATCH
+    # ========================
+    print("Applying RoPE fix for mixed precision...")
+    patched_count = 0
+    target_to_patch = model.core if hasattr(model, 'core') else model
+    for module in target_to_patch.modules():
+        if isinstance(module, OrthoRoPE):
+            module.forward = types.MethodType(corrected_rope_forward, module)
+            patched_count += 1
+    
+    if patched_count > 0:
+        print(f"✅ Patch applied successfully to {patched_count} RoPE module(s).")
+    else:
+        print("⚠️ Warning: No RoPE modules were found to patch.")
+
     model = model.to(device).bfloat16().eval()
     print("Model ready for inference.")
 
-    # 3. Load the VAE Decoder
+    # 4. Load the VAE Decoder
     # ========================
     print("Loading VAE decoder...")
     decoder = get_decoder_only(
@@ -97,19 +143,21 @@ def main(args):
     decode_fn = make_batched_decode_fn(decoder, train_cfg.vae_batch_size, temporal_vae=True)
     print("VAE decoder ready.")
     
-    # 4. Prepare Initial Frame and Action Sequence
+    # 5. Prepare Initial Frame and Action Sequence
     # ============================================
     print("Preparing initial data...")
     data_dir = Path(train_cfg.sample_data_kwargs.root_dir)
-    
-    # Load the first round from the validation set
-    latent_files = sorted(list((data_dir / "latents").glob("*.npy")))
+        
+    try:
+        first_round_dir = sorted([d for d in data_dir.iterdir() if d.is_dir() and d.name.startswith('round_')])[0]
+    except IndexError:
+        raise FileNotFoundError(f"No 'round_...' subdirectories found in {data_dir}")
+
+    latent_files = sorted(list((first_round_dir / "latents").glob("*.npy")))
     if not latent_files:
-        raise FileNotFoundError(f"No latent files found in {data_dir / 'latents'}")
+        raise FileNotFoundError(f"No latent files found in {first_round_dir / 'latents'}")
     
-    # Load the initial latent frames to provide context to the model
     initial_latents_full = np.load(latent_files[0])
-    # The latent is stored as (C, T, H, W), so we transpose it to (T, C, H, W)
     initial_latents_full = torch.from_numpy(initial_latents_full).permute(1, 0, 2, 3)
 
     context_window = train_cfg.data_kwargs.window_length
@@ -118,28 +166,24 @@ def main(args):
     
     print(f"Loaded initial latents with shape: {initial_latents.shape}")
 
-    # Prepare the action sequence
     if args.action_sequence:
         action_sequence = torch.tensor(args.action_sequence, device=device).long()
     else:
-        # Default action sequence: repeat a "punch" (action_id=8)
         print("No action sequence provided. Using default sequence (repeating punch).")
         action_sequence = torch.tensor([8] * args.num_frames, device=device).long()
         
-    # The model needs a full sequence of actions, including those for the initial context frames.
-    # We'll just repeat the first action for the context part.
     context_actions = action_sequence[0].repeat(context_window)
     full_action_sequence = torch.cat([context_actions, action_sequence]).unsqueeze(0)
     print(f"Full action sequence shape: {full_action_sequence.shape}")
     
-    # 5. Initialize the Sampler
+    # 6. Initialize the Sampler
     # ==========================
     print("Initializing sampler...")
     sampler_kwargs = train_cfg.sampler_kwargs
-    sampler_kwargs['num_frames'] = args.num_frames # Override with user-defined length
+    sampler_kwargs['num_frames'] = args.num_frames
     sampler = get_sampler_cls(train_cfg.sampler_id)(**sampler_kwargs)
     
-    # 6. Run Inference
+    # 7. Run Inference
     # =================
     print(f"Running inference to generate {args.num_frames} frames...")
     with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
@@ -152,14 +196,12 @@ def main(args):
         )
     print("Inference complete.")
 
-    # 7. Save Output
+    # 8. Save Output
     # ================
-    # The output from VAE is [B, C, T, H, W] in range [-1, 1]
-    video_out = video_out.squeeze(0) # Remove batch dim
+    video_out = video_out.squeeze(0)
     video_out = einops.rearrange(video_out, 'c t h w -> t h w c')
     video_out = ((video_out + 1) / 2.0 * 255.0).clamp(0, 255).to(torch.uint8).cpu().numpy()
 
-    # Create and save the video file
     output_path = Path(args.output_path)
     output_path.parent.mkdir(exist_ok=True, parents=True)
     clip = ImageSequenceClip(list(video_out), fps=30)
