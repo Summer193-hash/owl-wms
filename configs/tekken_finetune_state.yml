@@ -78,4 +78,5 @@ wandb:
   name: d-fusion
   project: OWL
   #CHANGE 4: New run name for tracking
+  group: pred-head
   run_name: tekken-rft-v2-finetune-state

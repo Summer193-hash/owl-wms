@@ -1,6 +1,7 @@
 name: owl-wms-multinode
 
 resources:
+  # The image_id will be automatically updated by the build_and_push.sh script
   image_id: anm5704/d-fusion:latest
   accelerators: H200:8
   cloud: kubernetes
@@ -9,26 +10,26 @@ num_nodes: 1
 
 setup: |
   # Commands to run inside the container
+  # The git commands below are not needed because your local code is already 
+  # copied into the Docker image during the build process.
+  # --------------------------------------------------------------------
   # cd /app
+  # git remote remove origin
+  # git remote add origin https://github.com/anm-ol/owl-wms.git
+  # git fetch
+  # git submodule sync --recursive
+  # git submodule update --init --recursive
+  # --------------------------------------------------------------------
 
-  # Git sync with repo
-  cd owl=wms
-  git remote remove origin
-  git remote add origin https://github.com/anm-ol/owl-wms.git
-  git fetch
-  git submodule sync --recursive
-  git submodule update --init --recursive
-
-  # Install new deps
+  # Install/update dependencies if requirements.txt has changed
   pip install -r requirements.txt
 
-  # fix nccl errors
-  apt install rdma-core libibverbs1 libibverbs-dev infiniband-diags -y
-  apt install -y libgl1-mesa-glx libglib2.0-0 libsm6 libxext6 libxrender-dev libgomp1
+  # Fix potential nccl errors in some environments
+  apt-get update && apt-get install -y rdma-core libibverbs1 libibverbs-dev infiniband-diags
+  apt-get install -y libgl1-mesa-glx libglib2.0-0 libsm6 libxext6 libxrender-dev libgomp1
 
-  pip install --upgrade torch==2.8.0 torchvision torchaudio
-
-
+  # This torch upgrade might not be necessary if the base Docker image is correct, but is kept for safety
+  # pip install --upgrade torch==2.8.0 torchvision torchaudio
   
 file_mounts:
   /app/my.env: ./.env
@@ -42,18 +43,13 @@ run: |
   MASTER_ADDR=$(echo "$SKYPILOT_NODE_IPS" | head -n1)
   echo "Starting distributed training, head node: $MASTER_ADDR"
 
-  # TODO
-  # Save compiled artifacts
-  # export TRITON_CACHE_DIR=/mnt/data/lapp0/triton_cache
-
-  # DEBUG
-  # export TORCH_LOGS="recompiles"
-  # export CUDA_LAUNCH_BLOCKING=1
-  # export TORCHDYNAMO_VERBOSE=1
-
   export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-  bash scripts/data.sh
+  # This script is not needed for training, it's for pre-processing.
+  # If your data is already pre-processed and available at the path specified
+  # in your config (e.g., preproccessing/cached_data_v3_ltx), you can comment this out.
+  # bash scripts/data.sh
+  
   # Run distributed training with torchrun
   torchrun \
     --nnodes=$SKYPILOT_NUM_NODES \
@@ -61,4 +57,4 @@ run: |
     --master_addr=$MASTER_ADDR \
     --node_rank=${SKYPILOT_NODE_RANK} \
     --master_port=8008 \
-     train.py --config_path configs/tekken_action.yml --nccl_timeout 1000
+     train.py --config_path configs/tekken_finetune_state.yml --nccl_timeout 1000
