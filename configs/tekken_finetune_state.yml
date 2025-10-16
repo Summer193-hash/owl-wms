@@ -1,0 +1,81 @@
+# configs/tekken_finetune_state.yml
+model:
+  model_id: tekken_rft_v2
+  sample_size: [14, 23]      # Latent H, W from your VAE
+  channels: 128              # Latent channels from your VAE
+  n_buttons: 8               # For the action embedding layer
+  n_layers: 16
+  n_heads: 16
+  d_model: 768
+  action_tokens_per_frame: null
+  image_tokens_per_frame: null
+  n_frames: 1000             # This is the window length
+  cfg_prob: 0.0
+  causal: true
+  uncond: false
+  backbone: dit
+  has_audio: false
+  local_window: 8
+  global_window: 32
+
+train:
+  trainer_id: tekken_rft_v2
+  data_id: tekken_multi
+  data_kwargs:
+    window_length: 8
+    temporal_compression: 8
+    root_dir: "preproccessing/cached_data_v3_ltx/train"
+
+  sample_data_id: tekken_multi
+  sample_data_kwargs:
+    window_length: 8
+    temporal_compression: 8
+    root_dir: "preproccessing/cached_data_v3_ltx/val"
+
+  target_batch_size: 256
+  batch_size: 32
+  compile: true
+
+  epochs: 50000
+  opt: Muon
+  opt_kwargs:
+    lr: 1.0e-4
+    momentum: 0.95
+    adamw_lr: 1.0e-6 # CHANGE 1: Lower learning rate for fine-tuning
+    adamw_wd: 1.0e-4
+    adamw_eps: 1.0e-15
+    adamw_betas: [0.9, 0.95]
+    adamw_keys: [core.proj_in, core.proj_out.proj, core.t_embed, core.action_embed, gate, adaln]
+
+  # CHANGE 2: Define new checkpoint paths
+  checkpoint_dir: checkpoints/tekken_finetune_state
+  output_path: checkpoints/tekken_finetune_state_ema
+  
+  # CHANGE 3: Point to your best video-only model checkpoint
+  resume_ckpt: /mnt/data/laplace/owl-wms/checkpoints/tekken_nopose_large_ema/step_65000.pt
+
+  sample_interval: 500
+  save_interval: 2000
+  n_samples: 8
+  eval_sample_dir: samples/tekken_finetune_state
+
+  sampler_id: t3_action_caching
+  sampler_kwargs:
+    n_steps: 40
+    cfg_scale: 1.0
+    num_frames: 16
+    noise_prev: 0.1
+    only_return_generated: false
+
+  # VAE settings for decoding samples
+  vae_id: ltx
+  vae_cfg_path: null
+  vae_ckpt_path: "preproccessing/checkpoints/LTXV/vae"
+  vae_scale: 1.0
+  vae_batch_size: 64
+
+wandb:
+  name: d-fusion
+  project: OWL
+  #CHANGE 4: New run name for tracking
+  run_name: tekken-rft-v2-finetune-state
