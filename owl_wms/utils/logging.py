@@ -5,12 +5,13 @@ import torch
 import einops as eo
 
 import numpy as np
-from .vis import draw_frames
-from .vis_tekken import draw_tekken_frames
+from .vis import draw_frames # Assuming .vis contains draw_frames
+from .vis_tekken import draw_tekken_frames # Assuming .vis_tekken contains draw_tekken_frames
 from moviepy.editor import ImageSequenceClip, CompositeVideoClip
 from moviepy.audio.AudioClip import AudioArrayClip
 
 import os
+import traceback # Import traceback for detailed error printing
 
 class LogHelper:
     """
@@ -61,27 +62,81 @@ class LogHelper:
         self.data = {}
         return final
 
+# --- REPLACED to_wandb FUNCTION ---
 @torch.no_grad()
-def to_wandb(x, actions, format='mp4', gather = False, max_samples = 8, fps=30):
-    # x is [b,n,c,h,w]
-    x = x.clamp(-1, 1)
-    x = x[:max_samples]
+def to_wandb(x, actions, format='mp4', gather=False, max_samples=8, fps=30):
+    """
+    Creates a WandB Video object with Tekken overlays.
+    Expects x: [B, C, T, H, W] tensor on CPU, range [-1, 1]. <--- NOTE: Changed expected input format
+    Expects actions: [B, T] tensor on CPU, action IDs.
+    """
+    print(f"[to_wandb] Received video tensor shape: {x.shape}, dtype: {x.dtype}, device: {x.device}")
+    print(f"[to_wandb] Received actions tensor shape: {actions.shape}, dtype: {actions.dtype}, device: {actions.device}")
 
-    if dist.is_initialized() and gather:
-        gathered = [None for _ in range(dist.get_world_size())]
-        dist.all_gather(gathered, x)
-        x = torch.cat(gathered, dim=0)
+    try:
+        # --- Input Validation and Preparation ---
+        if x is None or actions is None:
+            print("[to_wandb] ERROR: Received None for video or actions.")
+            return None
 
-    # Get labels on them
-    b, _ = actions.shape
-    temporal_compression = x.size(1) // actions.size(1) + 1
-    actions = actions.unsqueeze(-1).repeat(1, 1, temporal_compression).view(b, -1)
-    x = draw_tekken_frames(x, actions) # -> [b,n,c,h,w] [0,255] uint8 np
+        # Ensure input tensor x is in B, C, T, H, W format
+        if x.dim() != 5:
+            print(f"[to_wandb] ERROR: Expected video tensor dim 5 (B, C, T, H, W), got {x.dim()}")
+            return None
+        # Transpose to B, T, C, H, W for processing
+        x = x.permute(0, 2, 1, 3, 4) # B, C, T, H, W -> B, T, C, H, W
 
-    if max_samples == 8:
-        x = eo.rearrange(x, '(r c) n d h w -> n d (r h) (c w)', r = 2, c = 4)
+        x = x[:max_samples].cpu() # Work with max_samples on CPU
+        actions = actions[:max_samples].cpu()
 
-    return wandb.Video(x, format=format, fps=fps)
+
+        if actions.dim() != 2 or actions.shape[0] != x.shape[0] or actions.shape[1] != x.shape[1]:
+             print(f"[to_wandb] ERROR: Actions shape {actions.shape} incompatible with video shape {x.shape}")
+             # Attempt to fix if just length mismatch and B=1
+             if actions.dim() == 2 and x.dim() == 5 and actions.shape[0] == x.shape[0]:
+                 print(f"[to_wandb] Attempting to slice actions to match video length {x.shape[1]}")
+                 actions = actions[:, :x.shape[1]]
+                 print(f"[to_wandb] New actions shape: {actions.shape}")
+                 if actions.shape[1] != x.shape[1]: # Check again after slicing
+                     print("[to_wandb] ERROR: Action length still doesn't match video length after slicing.")
+                     return None
+             else:
+                return None
+
+
+        x = x.clamp(-1, 1)
+
+        # --- Draw Overlays ---
+        print("[to_wandb] Calling draw_tekken_frames...")
+        # draw_tekken_frames expects tensor [B, T, C, H, W], returns numpy [B, T, 3, H_ext, W] uint8
+        drawn_frames_np = draw_tekken_frames(x, actions)
+        print(f"[to_wandb] draw_tekken_frames output shape: {drawn_frames_np.shape}, dtype: {drawn_frames_np.dtype}")
+
+        # --- Arrange into Grid for WandB Video ---
+        b, t, c_out, h_out, w_out = drawn_frames_np.shape
+
+        # Simple vertical stack if multiple samples
+        if b > 1:
+            # Stack batches vertically: (T, C, B*H, W)
+            video_for_wandb = drawn_frames_np.transpose(1, 2, 0, 3, 4).reshape(t, c_out, b * h_out, w_out)
+        else:
+            # Single sample: (T, C, H, W)
+             video_for_wandb = drawn_frames_np[0].transpose(0, 1, 2, 3) # T, C, H, W
+
+        print(f"[to_wandb] Final video array shape for WandB: {video_for_wandb.shape}, dtype: {video_for_wandb.dtype}")
+
+        # --- Create WandB Video object ---
+        print("[to_wandb] Creating wandb.Video object...")
+        wandb_video_object = wandb.Video(video_for_wandb, format=format, fps=fps)
+        print("[to_wandb] wandb.Video object created successfully.")
+        return wandb_video_object # Return the object directly
+
+    except Exception as e:
+        print(f"[to_wandb] ERROR creating video: {e}")
+        print(traceback.format_exc()) # Print detailed traceback
+        return None # Return None on error
+# --- END REPLACED FUNCTION ---
+
 
 def to_wandb_gif(x, actions, max_samples = 4, format='mp4', fps=16):
     x = x.clamp(-1, 1)
@@ -160,11 +215,14 @@ def write_video_with_audio(path, vid, audio, fps=60,audio_fps=44100):
         video_clip = video_clip.set_audio(audio_clip)
 
     # Write to file
+    # Use threads=4 and logger=None to potentially reduce console spam from moviepy
     video_clip.write_videofile(
         path,
         fps=fps,
         codec='libx264',
         audio_codec='aac',
         temp_audiofile='temp-audio.m4a',
-        remove_temp=True
+        remove_temp=True,
+        threads=4,
+        logger=None # Suppress moviepy console output
     )

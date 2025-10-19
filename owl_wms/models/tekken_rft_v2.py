@@ -47,39 +47,47 @@ class TekkenRFTCoreV2(nn.Module):
             button_presses: [B, T, N_buttons]
             has_controls: classifier-free guidance mask
         """
-        b, n, c, h, w = x.shape
+        b, n, c, h, w = x.shape # n is the sequence length (T or S)
 
         # Time + action conditioning
         t_cond = self.t_embed(t)                           # [B, T, D]
         action_tokens = self.action_embed(button_presses)  # [B, T, 8, D]
         action_emb = action_tokens.mean(dim=2)             # [B, T, D]
-        cond_emb = t_cond + action_emb
+        # Note: cond_emb is not directly used by DiT's AdaLN, only t_cond is.
+        # It might be used elsewhere if your DiT implementation differs.
 
         # Flatten latents
         x_tokens = eo.rearrange(x, 'b t c h w -> b t (h w) c')
         x_tokens = self.proj_in(x_tokens)  # [B, T, H*W, D]
 
         # Prepare transformer input
-        b, t, s, d = x_tokens.shape
+        b, t, s, d = x_tokens.shape # t is sequence length (T or S), s is tokens per frame (H*W)
         transformer_input = x_tokens.view(b, t * s, d)
-        cond = t_cond.unsqueeze(2).expand(b, t, s, d).contiguous().view(b, t * s, d)
+        # DiT uses t_cond expanded for AdaLN modulation
+        cond_for_transformer = t_cond.unsqueeze(2).expand(b, t, s, d).contiguous().view(b, t * s, d)
 
         # Transformer forward
-        processed_tokens = self.transformer(transformer_input, cond, kv_cache)
+        processed_tokens = self.transformer(transformer_input, cond_for_transformer, kv_cache) # Shape [B, T*S, D]
 
-        # ✅ Predict state variables from last frame’s mean representation
-        processed_reshaped = processed_tokens.view(b, t, s, d)
-        last_frame_features = processed_reshaped[:, -1, :, :].mean(dim=1)  # [B, D]
-        predicted_states = self.state_predictor(last_frame_features)       # [B, 3]
+        # --- CORRECTED STATE PREDICTION ---
+        # Reshape to separate time and spatial tokens
+        processed_reshaped = processed_tokens.view(b, t, s, d) # Shape [B, T, S, D]
 
-        # Reconstruct latent output
-        processed_video_tokens = processed_tokens.view(b, t * s, d)
-        video_cond = t_cond.unsqueeze(2).expand(b, t, s, d).contiguous().view(b, t * s, d)
-        output_latents = self.proj_out(processed_video_tokens, video_cond)
-        output = eo.rearrange(output_latents, 'b (t h w) c -> b t c h w', t=t, h=h, w=w)
+        # Get the mean representation across spatial tokens *for each frame* in the sequence
+        frame_features = processed_reshaped.mean(dim=2) # Shape [B, T, D]
 
-        # Return both latents + state predictions
-        return output, predicted_states
+        # Predict states for *each frame* using the frame features
+        predicted_states = self.state_predictor(frame_features) # Shape should now be [B, T, 3]
+        # --- END CORRECTION ---
+
+        # Reconstruct latent output using the transformer's output
+        # The condition for proj_out should also match the transformer's conditioning (t_cond)
+        video_cond_for_proj_out = t_cond.unsqueeze(2).expand(b, t, s, d).contiguous().view(b, t * s, d)
+        output_latents = self.proj_out(processed_tokens, video_cond_for_proj_out) # Use processed_tokens directly
+        output_video = eo.rearrange(output_latents, 'b (t h w) c -> b t c h w', t=t, h=h, w=w)
+
+        # Return both video latents + state predictions
+        return output_video, predicted_states
 
 
 class TekkenRFTV2(nn.Module):
@@ -113,7 +121,8 @@ class TekkenRFTV2(nn.Module):
 
     def forward(self, x, action_ids=None, cfg_prob=None, has_controls=None, ts=None):
         """
-        Computes both the video denoising loss and optional state prediction.
+        Computes the video prediction and state prediction.
+        Note: Loss calculation is moved to the trainer.
         """
         B, S = x.size(0), x.size(1)
 
@@ -124,28 +133,41 @@ class TekkenRFTV2(nn.Module):
             has_controls = torch.zeros_like(has_controls)
             button_presses = torch.zeros(B, S, self.config.n_buttons, device=x.device, dtype=torch.float)
         else:
-            button_presses = action_id_to_buttons(action_ids)  # (B, T, 8)
+            # --- Ensure action_ids is long ---
+            button_presses = action_id_to_buttons(action_ids.long())  # (B, T, 8)
+            # --- End Change ---
+
 
         has_controls = self.handle_cfg(has_controls, cfg_prob)
 
-        with torch.no_grad():
-            ts = torch.randn(B, S, device=x.device, dtype=x.dtype).sigmoid()
-            lerpd_video, target_video = self.noise(x, ts[:, :, None, None, None])
+        # --- Ensure ts is passed correctly ---
+        if ts is None:
+             with torch.no_grad():
+                ts = torch.randn(B, S, device=x.device, dtype=x.dtype).sigmoid()
+
+        lerpd_video, target_video = self.noise(x, ts[:, :, None, None, None])
+        # --- End Change ---
+
 
         # Run the main model
+        # --- Pass ts to the core model ---
         pred_video, pred_states = self.core(lerpd_video, ts, button_presses, has_controls)
+        # --- End Change ---
 
-        # Compute reconstruction loss (standard RFT MSE)
-        loss_video = F.mse_loss(pred_video, target_video)
 
-        # Return loss and predictions (trainer can decide what to use)
-        return loss_video, pred_states
+        # Return predictions (trainer calculates loss)
+        return pred_video, pred_states
 
 
 def action_id_to_buttons(action_id: torch.Tensor):
     """Convert action IDs to 8-bit button press tensors [B, N, 8]."""
-    bit_positions = torch.arange(8, device=action_id.device, dtype=action_id.dtype)
+    # --- Ensure action_id is long for bitwise ops ---
+    action_id = action_id.long()
+    # --- End Change ---
+    bit_positions = torch.arange(8, device=action_id.device, dtype=action_id.dtype) # Use action_id's dtype for bit_positions too
     action_expanded = action_id.unsqueeze(-1)
     bit_positions = bit_positions.unsqueeze(0).unsqueeze(0)
     buttons = (action_expanded >> bit_positions) & 1
-    return buttons.int()
+    # --- Output float for ActionEmbedding ---
+    return buttons.float()
+    # --- End Change ---

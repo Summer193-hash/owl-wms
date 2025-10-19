@@ -47,39 +47,56 @@ class TekkenCachingActionSampler:
         batch_size = prev_latents.size(0)
 
         # Step 1: Prepare the initial noisy state
-        # Re-noise the context frames slightly and create a pure noise tensor for the new frame
         prev_latents_noised = self.zlerp(prev_latents, self.noise_prev)
         t_prev = prev_latents.new_full((batch_size, prev_latents.size(1)), self.noise_prev)
-        
+
         new_latent = torch.randn_like(prev_latents[:, :1]) # (b, 1, c, h, w)
         t_new = t_prev.new_ones(batch_size, 1)
 
         # Step 2: Populate the KV Cache with the context
         kv_cache.enable_cache_updates()
-        
+
         full_input_latents = torch.cat([prev_latents_noised, new_latent], dim=1)
         full_ts = torch.cat([t_prev, t_new], dim=1)
-        full_actions = torch.cat([prev_actions, curr_actions], dim=1) # (b, window_length+1, 8)
+        full_actions = torch.cat([prev_actions, curr_actions], dim=1) # (b, window_length+1)
+
         # Convert action IDs to button presses for the model
-        full_actions = action_id_to_buttons(full_actions) # (b, window_length+1, 8, d)
-        curr_actions = action_id_to_buttons(curr_actions) # (b, 1, 8, d)
+        # --- Make sure action_ids are long ---
+        full_button_presses = action_id_to_buttons(full_actions.long()) # (b, window_length+1, 8)
+        curr_button_presses = action_id_to_buttons(curr_actions.long()) # (b, 1, 8)
+        # --- End change ---
+
 
         # Single forward pass to populate cache (no CFG complexity)
-        _ = model(full_input_latents, full_ts, full_actions, kv_cache=kv_cache)
-        
+        # --- Pass button presses, not action ids ---
+        _ = model(full_input_latents, full_ts, full_button_presses, kv_cache=kv_cache)
+        # --- End change ---
+
         kv_cache.disable_cache_updates()
         kv_cache.truncate(1, front=True)  # Keep only the new frame being denoised
 
-        # Take the first Euler step (similar to AVCachingSampler)
-        eps_v = model(new_latent, t_new, curr_actions, kv_cache=kv_cache)
-        new_latent = new_latent - eps_v * dt[0]
-        t_new = t_new - dt[0]
+        # Take the first Euler step
+        # --- Pass button presses, not action ids ---
+        eps_v, _ = model(new_latent, t_new, curr_button_presses, kv_cache=kv_cache) # Ignore state output during sampling
+        # --- End change ---
+
+        # --- FIX TypeError ---
+        delta_t_0 = dt[0].item() # Convert scalar tensor to Python float
+        new_latent = new_latent - eps_v * delta_t_0
+        # --- END FIX ---
+        t_new = t_new - dt[0] # Keep t_new as tensor
 
         # Step 3: Remaining denoising steps for the new frame
         for step in range(1, self.n_steps):
-            eps_v = model(new_latent, t_new, curr_actions, kv_cache=kv_cache)
-            new_latent = new_latent - eps_v * dt[step]
-            t_new = t_new - dt[step]
+            # --- Pass button presses, not action ids ---
+            eps_v, _ = model(new_latent, t_new, curr_button_presses, kv_cache=kv_cache) # Ignore state output
+             # --- End change ---
+
+            # --- FIX TypeError ---
+            delta_t_step = dt[step].item() # Convert scalar tensor to Python float
+            new_latent = new_latent - eps_v * delta_t_step
+            # --- END FIX ---
+            t_new = t_new - dt[step] # Keep t_new as tensor
 
         return new_latent
 

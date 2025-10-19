@@ -33,7 +33,7 @@ train:
     root_dir: "preproccessing/cached_data_v3_ltx/val"
 
   target_batch_size: 256
-  batch_size: 32
+  batch_size: 8
   compile: true
 
   epochs: 50000
