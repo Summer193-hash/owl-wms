@@ -49,7 +49,7 @@ train:
 
   # CHANGE 2: Define new checkpoint paths
   checkpoint_dir: checkpoints/tekken_finetune_state
-  output_path: checkpoints/tekken_finetune_state_ema
+  output_path: checkpoints/tekken_finetune_state
   
   # CHANGE 3: Point to your best video-only model checkpoint
   resume_ckpt: /mnt/data/laplace/owl-wms/checkpoints/tekken_nopose_large_ema/step_65000.pt

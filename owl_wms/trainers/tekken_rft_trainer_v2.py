@@ -55,11 +55,47 @@ class TekkenRFTTrainerV2(BaseTrainer):
 
     def load(self):
         if hasattr(self.train_cfg, 'resume_ckpt') and self.train_cfg.resume_ckpt is not None:
-            save_dict = super().load(self.train_cfg.resume_ckpt)
-            self.get_module().load_state_dict(save_dict['model'])
-            self.ema.load_state_dict(save_dict['ema'])
-            self.opt.load_state_dict(save_dict['opt'])
-            self.total_step_counter = save_dict.get('steps', 0)
+            print(f"Loading weights from checkpoint: {self.train_cfg.resume_ckpt}")
+            # Load the raw state dict directly
+            state_dict = super().load(self.train_cfg.resume_ckpt)
+
+            # --- NEW LOADING LOGIC ---
+            try:
+                # Try loading directly into the main model (and handle potential DDP/compile prefixes)
+                self.get_module().load_state_dict(state_dict, strict=False) 
+                print("Successfully loaded weights into the main model.")
+
+                # Also load into the EMA model for consistency at the start
+                # Need to adjust keys if model was compiled (_orig_mod prefix)
+                ema_state_dict = {}
+                model_prefix = "_orig_mod." if list(state_dict.keys())[0].startswith("_orig_mod.") else ""
+                ema_prefix = "module." if self.world_size > 1 else "" # DDP prefix for EMA
+
+                for k, v in state_dict.items():
+                    # Strip potential compile prefix from the source key
+                    if k.startswith(model_prefix):
+                        key_base = k[len(model_prefix):]
+                    else:
+                        key_base = k
+                    # Add the DDP prefix expected by EMA's underlying model
+                    ema_key = f"ema_model.{ema_prefix}{key_base}"
+                    ema_state_dict[ema_key] = v
+
+                self.ema.load_state_dict(ema_state_dict, strict=False)
+                print("Successfully loaded weights into EMA model.")
+
+                # Since we are loading raw weights, reset step counter
+                self.total_step_counter = 0 
+                print("Reset step counter to 0 as loading raw weights.")
+
+            except Exception as e:
+                print(f"Error loading state dict: {e}")
+                print("Ensure the checkpoint contains compatible model weights.")
+                # Optional: raise e # Re-raise if you want the script to stop on error
+
+            # --- END NEW LOADING LOGIC ---
+        else:
+            print("No resume_ckpt specified, starting from scratch.")
 
     def get_sample_data(self):
         """Create a fresh sample batch for evaluation"""
@@ -169,11 +205,33 @@ class TekkenRFTTrainerV2(BaseTrainer):
                 
                 batch_vid = batch_vid.bfloat16() / self.train_cfg.vae_scale
                 with ctx:
-                    loss = self.model(batch_vid, action_ids=action_ids)
-                    loss = loss / accum_steps
+                    B, S = batch_vid_scaled.shape[:2]
+                    
+                    # 1. Sample timesteps and noise video (like original RFT)
+                    with torch.no_grad():
+                        ts = torch.randn(B, S, device=batch_vid_scaled.device, dtype=batch_vid_scaled.dtype).sigmoid()
+                        z_video = torch.randn_like(batch_vid_scaled)
+                        lerpd_video = batch_vid_scaled * (1 - ts[:, :, None, None, None]) + z_video * ts[:, :, None, None, None]
+                        target_video = z_video - batch_vid_scaled # Target is the velocity
+
+                    # 2. Call the model - it now returns two predictions
+                    # Make sure the model's forward can accept ts!
+                    pred_video, pred_states = self.model(lerpd_video, action_ids=action_ids, ts=ts) 
+
+                    # 3. Calculate separate losses
+                    video_loss = torch.nn.functional.mse_loss(pred_video, target_video)
+                    state_loss = torch.nn.functional.mse_loss(pred_states, batch_sta_scaled) # Compare prediction with ground truth states
+
+                    # 4. Combine losses (adjust weighting factor 0.1 as needed)
+                    loss = video_loss + 0.1 * state_loss 
+                    # --- END MODIFICATIONS ---
+
+                    loss = loss / accum_steps # Apply accumulation scaling AFTER combining
                 
                 loss.backward()
-                metrics.log('diffusion_loss', loss.item() * accum_steps)
+                metrics.log('diffusion_loss', video_loss.item()) # Log original video loss as diffusion_loss
+                metrics.log('video_loss', video_loss.item())    # Also log video loss separately
+                metrics.log('state_loss', state_loss.item())    # Log the new state loss
                 
                 local_step += 1
 
